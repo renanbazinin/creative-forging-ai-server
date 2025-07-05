@@ -10,48 +10,175 @@ const port = process.env.PORT || 3000;
 
 // Load Gemini API key & model from .env
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL   = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
 if (!GEMINI_API_KEY) {
   console.error('❌ No GEMINI_API_KEY in .env');
   process.exit(1);
 }
 
-// Enable CORS for all origins
 app.use(cors());
 app.use(bodyParser.json());
 
+// --- Game Constants ---
+const BOARD_SIZE = 10;
+const BLOCK_COUNT = 10;
+
+// --- Game Logic Helper Functions ---
+
+/**
+ * Checks if a coordinate is within the board boundaries.
+ */
+const isValidCoord = (r, c) => r >= 0 && r < BOARD_SIZE && c >= 0 && c < BOARD_SIZE;
+
+/**
+ * Finds all blocks (cells with value 1) on the board.
+ */
+const findBlocks = (board) => {
+  const blocks = [];
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      if (board[r][c] === 1) {
+        blocks.push({ r, c });
+      }
+    }
+  }
+  return blocks;
+};
+
+/**
+ * Counts connected blocks from a starting point using BFS.
+ */
+const countConnectedBlocks = (board, startNode) => {
+  if (!startNode) return 0;
+  const queue = [startNode];
+  const visited = new Set([`${startNode.r},${startNode.c}`]);
+  let count = 0;
+
+  while (queue.length > 0) {
+    const { r, c } = queue.shift();
+    count++;
+    const neighbors = [{ r: r - 1, c }, { r: r + 1, c }, { r, c: c - 1 }, { r, c: c + 1 }];
+
+    for (const neighbor of neighbors) {
+      const key = `${neighbor.r},${neighbor.c}`;
+      if (isValidCoord(neighbor.r, neighbor.c) && board[neighbor.r][neighbor.c] === 1 && !visited.has(key)) {
+        visited.add(key);
+        queue.push(neighbor);
+      }
+    }
+  }
+  return count;
+};
+
+/**
+ * Checks if the board is valid: 10x10, 10 blocks, one contiguous shape.
+ */
+const validateBoard = (board) => {
+  if (!Array.isArray(board) || board.length !== BOARD_SIZE || board.some(r => !Array.isArray(r) || r.length !== BOARD_SIZE)) {
+    return 'Board must be a 10x10 array.';
+  }
+  const blocks = findBlocks(board);
+  if (blocks.length !== BLOCK_COUNT) {
+    return `Board must have exactly ${BLOCK_COUNT} blocks.`;
+  }
+  if (countConnectedBlocks(board, blocks[0]) !== BLOCK_COUNT) {
+    return 'All blocks must form a single, continuous shape.';
+  }
+  return null; // Board is valid
+};
+
+/**
+ * Finds all possible valid moves for the current board state.
+ */
+const findAllValidMoves = (board) => {
+  const blocks = findBlocks(board);
+  const allMoves = [];
+
+  for (const block of blocks) {
+    // Create a temporary board without the current block
+    const tempBoard = board.map(row => [...row]);
+    tempBoard[block.r][block.c] = 0;
+    const remainingBlocks = findBlocks(tempBoard);
+
+    // Check for connectivity (is it a bridge?)
+    if (countConnectedBlocks(tempBoard, remainingBlocks[0]) === remainingBlocks.length) {
+      // If not a bridge, find valid destinations
+      const validDestinations = new Set();
+      for (const otherBlock of remainingBlocks) {
+        const neighbors = [{ r: otherBlock.r - 1, c: otherBlock.c }, { r: otherBlock.r + 1, c: otherBlock.c }, { r: otherBlock.r, c: otherBlock.c - 1 }, { r: otherBlock.r, c: otherBlock.c + 1 }];
+        for (const neighbor of neighbors) {
+          if (isValidCoord(neighbor.r, neighbor.c) && tempBoard[neighbor.r][neighbor.c] === 0) {
+            validDestinations.add(`${neighbor.r},${neighbor.c}`);
+          }
+        }
+      }
+      if (validDestinations.size > 0) {
+        allMoves.push({
+          from: block,
+          to: Array.from(validDestinations).map(s => ({ r: parseInt(s.split(',')[0]), c: parseInt(s.split(',')[1]) })),
+        });
+      }
+    }
+  }
+  return allMoves;
+};
+
+// --- API Endpoints ---
+
 app.get('/', (req, res) => {
   res.send(`
-Welcome to the Gemini Shape & Board API!
+Welcome to the Creative Block Mover API!
 
-  POST /getBoard  →  Ask Gemini to place 1–3 new pixels and return the full 50×50 board  
-  POST /predict   →  Ask Gemini to identify what the user is drawing
+POST /getBoard  →  Provide a 10x10 board, and the AI will make a creative move.
+POST /predict   →  The AI will identify the shape on the board.
   `);
 });
 
 // POST /getBoard
-// Accepts a 10×10 array of 0/1 and asks Gemini to place the next 1–3 blocks,
-// then return ONLY the complete 10×10 JSON array (no fences, no extra text).
+// Receives a board, finds all valid moves, asks Gemini to pick one,
+// and returns the new board state.
 app.post('/getBoard', async (req, res) => {
-  let board = req.body;
-  // If client sends 51 rows, ignore the last row
-  if (Array.isArray(board) && board.length === 51) {
-    board = board.slice(0, 50);
+  const { board } = req.body;
+  const validationError = validateBoard(board);
+  if (validationError) {
+    return res.status(400).json({ error: validationError });
   }
-  if (
-    !Array.isArray(board) ||
-    board.length !== 50 ||
-    board.some(r => !Array.isArray(r) || r.length !== 50 || r.some(c => c !== 0 && c !== 1))
-  ) {
-    return res.status(400).json({ error: 'Expect a 50×50 array of 0s and 1s.' });
+
+  const possibleMoves = findAllValidMoves(board);
+  if (possibleMoves.length === 0) {
+    return res.status(400).json({ error: 'No valid moves available on the provided board.' });
   }
 
   const prompt = `
-You are given a 50×50 JSON array called "board", where 1 means a pixel is drawn and 0 means empty. imagine this as incomplete drawing (mostly think of objects like houses, trees, animals, etc. but even letter are possible).; to to be creative and think what the user wants.
-Think of what to do to progress the complete of the drawing; choose exactly 1–3 new pixels to continue the drawing, be creative and think what the user wants, and **return only** the updated 50×50 JSON array with those new pixels set to 1. No markdown, no explanation.
-Board:
+You are an AI playing a creative block-moving game on a 10x10 board. Your goal is to make the current drawing more interesting and recognizable by moving the blocks.
+
+**GAME RULES - YOU MUST FOLLOW THESE:**
+1.  **Block Count:** The final board MUST contain EXACTLY 10 blocks (represented by \`1\`). Not 9, not 11, but 10.
+2.  **Connectivity:** All 10 blocks MUST form a single, continuous shape. Blocks connect ONLY up, down, left, or right. **DIAGONAL CONNECTIONS ARE FORBIDDEN.** No separate islands or disconnected blocks are allowed.
+3.  **Valid Moves:** Each move must be valid. A block can only move to an empty space adjacent to the main shape. You cannot move a block if doing so would split the shape into two pieces.
+
+**Your Task:**
+1.  Analyze the current board.
+2.  Plan a sequence of 1 to 2 valid moves to improve the drawing.
+3.  Form your top 3 predictions for what the final drawing represents.
+
+**Constraint Checklist (Your response MUST satisfy these):**
+- Does the "board" have exactly 10 blocks? [ ]
+- Do all 10 blocks form a single connected shape (NO DIAGONALS, NO ISLANDS)? [ ]
+- Is the "predict" value an array of 3 strings? [ ]
+
+**Return ONLY a single JSON object with the final state (no markdown fences or explanations):**
+{
+  "predict": ["<your best prediction>", "<your second best>", "<your third best>"],
+  "board": [[...the final 10x10 board after your 1-2 moves...]]
+}
+
+Current Board:
 ${JSON.stringify(board)}
+
+Possible First Moves (for your reference):
+${JSON.stringify(possibleMoves, null, 2)}
   `.trim();
 
   try {
@@ -59,38 +186,53 @@ ${JSON.stringify(board)}
     const { data } = await axios.post(
       url,
       { contents: [{ parts: [{ text: prompt }] }] },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-goog-api-key': GEMINI_API_KEY
-        }
-      }
+      { headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_API_KEY } }
     );
-    // Gemini’s raw reply is in data.candidates[0].content.parts[0].text
-    res.send(data.candidates[0].content.parts[0].text);
+
+    const responseText = data.candidates[0].content.parts[0].text;
+    console.log("--- Raw AI Response Text ---");
+    console.log(responseText);
+    console.log("----------------------------");
+
+    // Clean the response to remove markdown fences
+    const cleanedText = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+    console.log("--- Cleaned AI Response for JSON Parsing ---");
+    console.log(cleanedText);
+    console.log("------------------------------------------");
+
+    const aiResponse = JSON.parse(cleanedText);
+
+    const { predict, board: newBoard } = aiResponse;
+
+    // Validate the board returned by the AI
+    const finalValidationError = validateBoard(newBoard);
+    if (finalValidationError) {
+      console.error('AI returned an invalid board:', finalValidationError);
+      return res.status(500).json({ error: 'AI returned an invalid board state.', details: finalValidationError });
+    }
+
+    res.json({ board: newBoard, predict });
+
   } catch (err) {
-    console.error('Gemini error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Gemini error', details: err.response?.data || err.message });
+    console.error('Gemini error or JSON parsing error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Error processing AI response.', details: err.response?.data || err.message });
   }
 });
 
 // POST /predict
-// Accepts the same 10×10 board and asks Gemini to identify the shape only.
-// Returns a JSON object: { "shape": "<description>" }
+// Receives a board and asks Gemini to identify the shape.
 app.post('/predict', async (req, res) => {
-  const board = req.body;
-  if (
-    !Array.isArray(board) ||
-    board.length !== 50 ||
-    board.some(r => !Array.isArray(r) || r.length !== 50 || r.some(c => c !== 0 && c !== 1))
-  ) {
-    return res.status(400).json({ error: 'Expect a 50×50 array of 0s and 1s.' });
+  const { board } = req.body;
+  const validationError = validateBoard(board);
+  if (validationError) {
+    return res.status(400).json({ error: validationError });
   }
 
   const prompt = `
-You are given a 50×50 JSON array called "board", where 1 means a pixel is drawn and 0 means empty.  imagine this as drawing (mostly think of objects like houses, trees, animals, etc. but even letter are possible).
-Look at this as a user's drawing; identify what the user is drawing in a few words, and **return only** this JSON object (no fences, no explanation):
-{"draw":"<short description>"}
+You are given a 10x10 JSON array called "board" with 10 blocks forming a shape.
+In a few words, what does this shape look like? Be creative.
+Return ONLY a JSON object like this: {"shape": "<your description>"}
+
 Board:
 ${JSON.stringify(board)}
   `.trim();
@@ -100,13 +242,9 @@ ${JSON.stringify(board)}
     const { data } = await axios.post(
       url,
       { contents: [{ parts: [{ text: prompt }] }] },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-goog-api-key': GEMINI_API_KEY
-        }
-      }
+      { headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_API_KEY } }
     );
+
     res.send(data.candidates[0].content.parts[0].text);
   } catch (err) {
     console.error('Gemini error:', err.response?.data || err.message);
@@ -115,5 +253,5 @@ ${JSON.stringify(board)}
 });
 
 app.listen(port, () => {
-  console.log(`🚀 Listening on http://localhost:${port} using model ${GEMINI_MODEL}`);
+  console.log(`🚀 Server listening on http://localhost:${port}`);
 });
